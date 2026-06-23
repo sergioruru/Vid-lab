@@ -138,7 +138,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/quality — качество видео (360/480/720/1080)\n"
         f"/stats — моя статистика\n"
         f"/donate — поддержать проект\n\n"
-        f"Pro → @rusinov_s"
+        f"Pro → @sergioru"
     )
 
 
@@ -155,7 +155,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚧 Донат-модель скоро. Пока пиши @rusinov_s")
+    await update.message.reply_text("🚧 Донат-модель скоро. Пока пиши @sergioru")
 
 
 def _quality_keyboard(current: str) -> list:
@@ -186,7 +186,7 @@ async def quality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q in ("1080", "best") and not premium:
             await update.message.reply_text(
                 "1080p и best доступны только для Pro-подписки.\n"
-                f"Текущий: {current}p\nПо вопросам: @rusinov_s"
+                f"Текущий: {current}p\nПо вопросам: @sergioru"
             )
             return
         set_user_quality(user_id, q)
@@ -220,7 +220,7 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q in ("1080", "best") and not premium:
         await query.edit_message_text(
             f"1080p и best доступны только для Pro.\n"
-            f"Текущий: {get_user_quality(user_id)}p\nПо вопросам: @rusinov_s"
+            f"Текущий: {get_user_quality(user_id)}p\nПо вопросам: @sergioru"
         )
         return
 
@@ -242,7 +242,7 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"❌ Дневной лимит ({FREE_LIMIT} видео) исчерпан.\n"
                 f"Подписка Pro: 990₽/мес — безлимит.\n"
-                f"По вопросам: @rusinov_s"
+                f"По вопросам: @sergioru"
             )
             return
 
