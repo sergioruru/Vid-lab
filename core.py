@@ -31,6 +31,105 @@ def resolve_format(quality: str, is_premium: bool = False) -> str:
     return QUALITY_FORMATS[quality]
 
 
+def estimate_sizes(url: str) -> dict:
+    """Оценить размер видео для всех качеств без скачивания.
+    Возвращает {quality: size_mb_or_none} или {} при ошибке."""
+    try:
+        info = subprocess.run(
+            [YT_DLP, "--dump-json", "--no-warnings", url],
+            capture_output=True, text=True, timeout=30
+        )
+        if info.returncode != 0:
+            return {}
+        meta = json.loads(info.stdout)
+    except Exception:
+        return {}
+
+    formats = meta.get("formats", [])
+    duration = meta.get("duration", 0)
+
+    # Разделяем форматы
+    muxed = [
+        f for f in formats
+        if f.get("vcodec") and f["vcodec"] != "none"
+        and f.get("acodec") and f["acodec"] != "none"
+        and f.get("height")
+    ]
+    video_only = [
+        f for f in formats
+        if f.get("vcodec") and f["vcodec"] != "none"
+        and (not f.get("acodec") or f["acodec"] == "none")
+        and f.get("height")
+    ]
+    audio_only = [
+        f for f in formats
+        if (not f.get("vcodec") or f["vcodec"] == "none")
+        and f.get("acodec") and f["acodec"] != "none"
+    ]
+
+    def _filesize(f):
+        return f.get("filesize") or f.get("filesize_approx") or 0
+
+    result = {}
+    for q in ["360", "480", "720", "1080", "best"]:
+        if q == "best":
+            target_h = 99999
+        else:
+            target_h = int(q)
+
+        # 1. Muxed формат — только если его высота близка к target_h (≥80%)
+        best_muxed = None
+        for f in sorted(muxed, key=lambda x: x.get("height", 0), reverse=True):
+            h = f.get("height", 0)
+            if h <= target_h and h >= target_h * 0.8:
+                best_muxed = f
+                break
+
+        # 2. Video-only — максимальное разрешение ≤ target_h, по лучшему битрейту
+        best_video = None
+        best_video_alt = None  # запасной вариант с меньшим разрешением
+        for f in sorted(video_only, key=lambda x: x.get("tbr", 0) or x.get("vbr", 0) or 0, reverse=True):
+            h = f.get("height", 0)
+            if h <= target_h:
+                if h == target_h or (target_h - h) <= 100:
+                    best_video = f
+                    break
+                if not best_video_alt:
+                    best_video_alt = f
+
+        if not best_video:
+            best_video = best_video_alt
+
+        # 3. Лучшее audio
+        best_audio = None
+        for f in sorted(audio_only, key=lambda x: x.get("tbr", 0) or x.get("abr", 0) or 0, reverse=True):
+            best_audio = f
+            break
+
+        size = None
+        # Приоритет: muxed (если есть) > video+audio
+        if best_muxed:
+            s = _filesize(best_muxed)
+            if s:
+                size = s
+        if not size and best_video and best_audio:
+            vs = _filesize(best_video)
+            a_s = _filesize(best_audio)
+            if vs and a_s:
+                size = vs + a_s
+        # Fallback: по битрейту
+        if not size and best_video and duration:
+            tbr = best_video.get("tbr", 0) or best_video.get("vbr", 0) or 0
+            abr = best_audio.get("abr", 0) or best_audio.get("tbr", 0) or 0 if best_audio else 0
+            if tbr:
+                size = (tbr + abr) * duration / 8
+
+        if size:
+            result[q] = round(size / (1024 * 1024), 1)
+
+    return result
+
+
 def download_video(url: str, quality: str = "720", is_premium: bool = False,
                    progress_callback=None) -> dict:
     """

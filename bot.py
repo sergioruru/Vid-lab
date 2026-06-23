@@ -6,7 +6,7 @@ import os, sys, logging, asyncio, re
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from core import download_video
+from core import download_video, estimate_sizes
 from s3_upload import upload_file
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -128,12 +128,15 @@ def set_user_quality(user_id: int, quality: str):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user.id, update.effective_user.username)
     await update.message.reply_text(
-        f"🎬 vid-lab — скачиваю и обрабатываю видео\n\n"
-        f"Просто отправь ссылку на YouTube / Instagram / TikTok\n\n"
+        f"🎬 vid-lab — загружаю видео с YouTube, Instagram, TikTok\n\n"
+        f"Просто отправь ссылку — бот оценит размеры ДО скачивания:\n"
+        f"▫️ ≤42 MiB → сразу в Telegram\n"
+        f"▫️ >42 MiB → ссылка в облаке на 24ч\n\n"
         f"▫️ Бесплатно: {FREE_LIMIT} видео/день\n"
         f"▫️ Pro: безлимит — 990₽/мес\n"
         f"▫️ Agency: мониторинг + пакетная обработка — 2490₽/мес\n\n"
-        f"Помощь: /help"
+        f"Помощь: /help\n"
+        f"Pro → @sergioru"
     )
 
 
@@ -141,13 +144,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎬 vid-lab | B2B-инструмент для видео\n\n"
         "📥 Отправь ссылку — бот скачает видео\n"
-        "📺 YouTube, Instagram, TikTok\n\n"
+        "📺 YouTube, Instagram (Reels), TikTok\n\n"
         f"Команды:\n"
         f"/start — приветствие\n"
         f"/help — эта справка\n"
         f"/quality — качество видео (360/480/720/1080)\n"
         f"/stats — моя статистика\n"
-        f"/donate — поддержать проект\n\n"
+        f"/donate — подписка Pro\n\n"
         f"Pro → @sergioru"
     )
 
@@ -165,7 +168,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def donate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚧 Донат-модель скоро. Пока пиши @sergioru")
+    await update.message.reply_text(
+        "💎 vid-lab Pro — безлимит на скачивания\n\n"
+        "▫️ 990₽/мес — безлимит\n"
+        "▫️ 2490₽/мес — Agency (мониторинг + пакетная обработка)\n\n"
+        "По вопросам: @sergioru"
+    )
 
 
 def _quality_keyboard(current: str) -> list:
@@ -267,7 +275,19 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Отправь ссылку на YouTube / Instagram / TikTok")
         return
 
-    # Прогресс-бар
+    # Предварительная оценка размеров (без скачивания)
+    msg = await update.message.reply_text("🔍 Оцениваю размеры...")
+    loop = asyncio.get_event_loop()
+    sizes = await loop.run_in_executor(None, lambda: estimate_sizes(url))
+
+    if sizes:
+        current_size = sizes.get(quality)
+        if current_size and current_size > S3_THRESHOLD_MB:
+            # Не влезает — показываем панель с вариантами ДО скачивания
+            await _show_size_options(update, context, user_id, msg, quality, premium, sizes, url)
+            return
+
+    # ≤42 MiB или нет оценки — скачиваем
     async def update_status(text):
         nonlocal msg
         try:
@@ -276,10 +296,8 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     quality_label = f"{quality.replace('best', 'max')}p"
-    msg = await update.message.reply_text(f"⏳ Скачиваю ({quality_label})...")
+    await msg.edit_text(f"⏳ Скачиваю ({quality_label})...")
 
-    # Скачиваем в потоке с callback в главный event loop
-    loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
         lambda: download_video(url, quality=quality, is_premium=premium,
@@ -296,7 +314,6 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if file_size <= S3_THRESHOLD_MB:
-            # ≤42 MiB → сразу в Telegram
             caption = f"✅ {result['title'][:60]}\n{file_size} MiB ({actual_quality}p)"
             with open(file_path, "rb") as f:
                 await update.message.reply_video(
@@ -307,29 +324,11 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             increment_daily(user_id)
             await msg.delete()
         else:
-            # >42 MiB
-            actual_num = int(actual_quality.rstrip('p')) if actual_quality not in ('best', 'max') else 999
-            if actual_num > 360:
-                # Предлагаем выбор: 360p в Telegram или S3
-                await _offer_quality_choice(update, context, user_id, msg, result, quality, url)
-                increment_daily(user_id)
-                # Не чистим файл — он в _pending_downloads
-                return  # пропускаем finally
-            else:
-                # Уже 360p и >42 MiB → сразу в S3
-                await msg.edit_text("⏳ Загружаю в облако...")
-                safe_name = re.sub(r'[^\w\.-]', '_', f"{result['title'][:50]}.mp4")
-                s3_url = await loop.run_in_executor(None, lambda: upload_file(file_path, safe_name))
-                if s3_url:
-                    await msg.edit_text(
-                        f"✅ {result['title'][:60]}\n{file_size} MiB ({actual_quality}p)\n"
-                        f"Ссылка на 24ч:\n{s3_url}"
-                    )
-                    increment_daily(user_id)
-                else:
-                    await msg.edit_text("❌ Не удалось загрузить в облако.")
+            # >42 MiB — fallback: показываем выбор (без повторного скачивания)
+            await _offer_quality_choice(update, context, user_id, msg, result, quality, url)
+            increment_daily(user_id)
+            return
     finally:
-        # Чистка
         try:
             os.remove(file_path)
             compressed = file_path.rsplit(".", 1)[0] + "_compressed.mp4"
@@ -341,6 +340,126 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Хранилище для выбора качества при больших файлах ---
 _pending_downloads = {}  # msg_id -> {user_id, url, title, file_path, size, quality, chat_id, message_id}
+
+_PREVIEW_CACHE = {}  # url -> {quality: size_mb}
+
+
+async def _show_size_options(update, context, user_id, msg, current_quality, premium, sizes, url):
+    """Показать размеры ДО скачивания. Только для предварительной оценки."""
+    _PREVIEW_CACHE[url] = sizes
+
+    lines = [f"📹 Размеры для каждого качества (без скачивания):\n"]
+    for q in ["360", "480", "720", "1080", "best"]:
+        s = sizes.get(q)
+        if s is None:
+            continue
+        if q in ("1080", "best") and not premium:
+            lines.append(f"▫️ {q}p: ~{s} MiB 🔒 Pro")
+        else:
+            mark = "✅" if q == current_quality else "▫️"
+            fits = "✓ в Telegram" if s <= S3_THRESHOLD_MB else f"⚡ ссылка в облаке ({s} MiB)"
+            lines.append(f"{mark} {q}p: ~{s} MiB — {fits}")
+
+    lines.append("\nВыбери качество для скачивания:")
+
+    buttons = []
+    for q in ["360", "480", "720", "1080", "best"]:
+        s = sizes.get(q)
+        if s is None:
+            continue
+        if q in ("1080", "best") and not premium:
+            continue
+        label = f"{q}p (~{s} MiB)"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"psize_{q}")])
+
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="psize_cancel")])
+
+    await msg.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+    # Сохраняем контекст
+    _pending_downloads[msg.message_id] = {
+        "user_id": user_id,
+        "url": url,
+        "chat_id": update.effective_chat.id,
+        "preview": True,
+    }
+
+
+async def _handle_size_choice(update, context):
+    """Обработка выбора качества из предварительной панели."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    msg_id = query.message.message_id
+    user_id = update.effective_user.id
+
+    if data == "psize_cancel":
+        await query.edit_message_text("❌ Отменено")
+        _cleanup_pending(msg_id)
+        return
+
+    q = data.replace("psize_", "")
+    ctx = _pending_downloads.get(msg_id)
+    if not ctx:
+        await query.edit_message_text("❌ Устарело, отправь ссылку заново.")
+        return
+
+    url = ctx["url"]
+    await query.edit_message_text(f"⏳ Скачиваю {q}p...")
+
+    loop = asyncio.get_event_loop()
+    async def update_status(text):
+        try:
+            await query.edit_message_text(text[:200])
+        except:
+            pass
+
+    result = await loop.run_in_executor(
+        None,
+        lambda: download_video(url, quality=q, is_premium=is_premium(user_id),
+                               progress_callback=lambda t: asyncio.run_coroutine_threadsafe(update_status(t), loop))
+    )
+
+    if result["error"]:
+        await query.edit_message_text(f"❌ Ошибка: {result['error']}")
+        _cleanup_pending(msg_id)
+        return
+
+    file_size = result["size_mb"]
+    file_path = result["path"]
+
+    try:
+        if file_size <= S3_THRESHOLD_MB:
+            caption = f"✅ {result['title'][:60]}\n{file_size} MiB ({q}p)"
+            with open(file_path, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=ctx["chat_id"], video=f, caption=caption,
+                    supports_streaming=True, read_timeout=180, write_timeout=180,
+                )
+            increment_daily(user_id)
+            await query.delete_message()
+        else:
+            safe_name = re.sub(r'[^\w\.-]', '_', f"{result['title'][:50]}.mp4")
+            await query.edit_message_text("⏳ Загружаю в облако...")
+            s3_url = await loop.run_in_executor(None, lambda: upload_file(file_path, safe_name))
+            if s3_url:
+                await query.edit_message_text(
+                    f"✅ {result['title'][:60]}\n{file_size} MiB ({q}p)\n"
+                    f"Скачать (24ч):\n{s3_url}"
+                )
+                increment_daily(user_id)
+            else:
+                await query.edit_message_text("❌ Не удалось загрузить.")
+    finally:
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+    _cleanup_pending(msg_id)
 
 
 async def _offer_quality_choice(update, context, user_id, msg, result, quality, url):
@@ -356,7 +475,7 @@ async def _offer_quality_choice(update, context, user_id, msg, result, quality, 
         f"Выбери действие:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📱 Скачать 360p (прямо в Telegram)", callback_data="dl_360")],
-            [InlineKeyboardButton(f"💾 Скачать {actual_quality}p (ссылка на S3)", callback_data="dl_s3")],
+            [InlineKeyboardButton(f"💾 Скачать {actual_quality}p (ссылка в облаке)", callback_data="dl_s3")],
             [InlineKeyboardButton("❌ Отмена", callback_data="dl_cancel")],
         ])
     )
@@ -430,7 +549,7 @@ async def dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if s3_url:
                     await query.edit_message_text(
                         f"✅ {result['title'][:60]}\n{new_size} MiB (360p)\n"
-                        f"Ссылка на 24ч:\n{s3_url}"
+                        f"Скачать (24ч):\n{s3_url}"
                     )
                     increment_daily(user_id)
                 else:
@@ -451,7 +570,7 @@ async def dl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if s3_url:
             await query.edit_message_text(
                 f"✅ {ctx['title'][:60]}\n{ctx['size']} MiB ({ctx['actual_quality']}p)\n"
-                f"Ссылка на 24ч:\n{s3_url}"
+                f"Скачать (24ч):\n{s3_url}"
             )
             increment_daily(user_id)
         else:
@@ -485,6 +604,7 @@ def main():
     app.add_handler(CommandHandler("donate", donate))
     app.add_handler(CallbackQueryHandler(quality_callback, pattern=r"^qlty_"))
     app.add_handler(CallbackQueryHandler(dl_callback, pattern=r"^dl_"))
+    app.add_handler(CallbackQueryHandler(_handle_size_choice, pattern=r"^psize_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_url))
     app.add_error_handler(error_handler)
 
