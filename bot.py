@@ -89,9 +89,19 @@ def increment_daily(user_id: int):
 
 def is_premium(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT tier FROM users WHERE id=?", (user_id,)).fetchone()
+    row = conn.execute("SELECT tier, tier_expires FROM users WHERE id=?", (user_id,)).fetchone()
     conn.close()
-    return row and row[0] in ("pro", "agency")
+    if not row or row[0] not in ("pro", "agency"):
+        return False
+    # Если есть срок действия — проверяем
+    if row[1]:
+        try:
+            expires = datetime.date.fromisoformat(row[1])
+            if datetime.date.today() > expires:
+                return False  # тариф истёк
+        except (ValueError, TypeError):
+            pass
+    return True
 
 
 QUALITY_VALUES = {"360", "480", "720", "1080", "best"}
